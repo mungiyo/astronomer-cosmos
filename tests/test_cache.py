@@ -31,11 +31,14 @@ from cosmos.cache import (
     _copy_partial_parse_to_project,
     _create_cache_identifier,
     _create_seed_checksum_key,
+    _fetch_partial_parse_from_remote,
     _get_latest_cached_package_lockfile,
     _get_latest_partial_parse,
     _get_or_create_profile_cache_dir,
+    _get_remote_partial_parse_dir,
     _get_sha1_hash,
     _update_partial_parse_cache,
+    _upload_partial_parse_to_remote,
     create_cache_profile,
     delete_unused_dbt_cache,
     get_cache_seed_checksum,
@@ -181,6 +184,139 @@ def test_update_partial_parse_cache_writes_files_atomically(tmp_path):
         DBT_MANIFEST_FILE_NAME,
         DBT_PARTIAL_PARSE_FILE_NAME,
     ]
+
+
+def _create_local_partial_parse_artifacts(base_dir: Path) -> Path:
+    """Create partial parse + manifest files under ``base_dir/target`` and return the partial parse path."""
+    target_dir = base_dir / DBT_TARGET_DIR_NAME
+    target_dir.mkdir(parents=True, exist_ok=True)
+    partial_parse_filepath = target_dir / DBT_PARTIAL_PARSE_FILE_NAME
+    partial_parse_filepath.write_bytes(b"partial-parse-content")
+    (target_dir / DBT_MANIFEST_FILE_NAME).write_text("manifest-content")
+    return partial_parse_filepath
+
+
+def test_get_remote_partial_parse_dir_disabled_by_default():
+    assert _get_remote_partial_parse_dir("dag") is None
+
+
+@patch("cosmos.cache.settings.enable_remote_cache_partial_parse", True)
+@patch("cosmos.cache._configure_remote_cache_dir", return_value=None)
+def test_get_remote_partial_parse_dir_without_remote_cache_dir(mock_configure_remote_cache_dir):
+    assert _get_remote_partial_parse_dir("dag") is None
+
+
+@patch("cosmos.cache.settings.enable_remote_cache_partial_parse", True)
+@patch("cosmos.cache._configure_remote_cache_dir")
+def test_get_remote_partial_parse_dir(mock_configure_remote_cache_dir, tmp_path):
+    mock_configure_remote_cache_dir.return_value = tmp_path
+    assert _get_remote_partial_parse_dir("dag") == tmp_path / "dag" / DBT_TARGET_DIR_NAME
+
+
+@patch("cosmos.cache.settings.enable_remote_cache_partial_parse", True)
+@patch("cosmos.cache._configure_remote_cache_dir")
+def test_fetch_partial_parse_from_remote(mock_configure_remote_cache_dir, tmp_path):
+    remote_cache_dir = tmp_path / "remote"
+    mock_configure_remote_cache_dir.return_value = remote_cache_dir
+    _create_local_partial_parse_artifacts(remote_cache_dir / "dag")
+
+    local_cache_dir = tmp_path / "local"
+    _fetch_partial_parse_from_remote("dag", local_cache_dir)
+
+    local_target_dir = local_cache_dir / DBT_TARGET_DIR_NAME
+    assert (local_target_dir / DBT_PARTIAL_PARSE_FILE_NAME).read_bytes() == b"partial-parse-content"
+    assert (local_target_dir / DBT_MANIFEST_FILE_NAME).read_text() == "manifest-content"
+
+
+@patch("cosmos.cache.settings.enable_remote_cache_partial_parse", True)
+@patch("cosmos.cache._configure_remote_cache_dir")
+def test_fetch_partial_parse_from_remote_without_remote_file(mock_configure_remote_cache_dir, tmp_path):
+    remote_cache_dir = tmp_path / "remote"
+    remote_cache_dir.mkdir()
+    mock_configure_remote_cache_dir.return_value = remote_cache_dir
+
+    local_cache_dir = tmp_path / "local"
+    _fetch_partial_parse_from_remote("dag", local_cache_dir)
+
+    assert not (local_cache_dir / DBT_TARGET_DIR_NAME / DBT_PARTIAL_PARSE_FILE_NAME).exists()
+
+
+def test_fetch_partial_parse_from_remote_disabled_by_default(tmp_path):
+    local_cache_dir = tmp_path / "local"
+    _fetch_partial_parse_from_remote("dag", local_cache_dir)
+    assert not (local_cache_dir / DBT_TARGET_DIR_NAME / DBT_PARTIAL_PARSE_FILE_NAME).exists()
+
+
+@patch("cosmos.cache.settings.enable_remote_cache_partial_parse", True)
+@patch("cosmos.cache._download_remote_file", side_effect=OSError("connection reset"))
+@patch("cosmos.cache._configure_remote_cache_dir")
+def test_fetch_partial_parse_from_remote_swallows_errors(
+    mock_configure_remote_cache_dir, mock_download_remote_file, tmp_path, caplog
+):
+    remote_cache_dir = tmp_path / "remote"
+    mock_configure_remote_cache_dir.return_value = remote_cache_dir
+    _create_local_partial_parse_artifacts(remote_cache_dir / "dag")
+
+    _fetch_partial_parse_from_remote("dag", tmp_path / "local")
+
+    assert "Unable to fetch the partial parse cache from remote" in caplog.text
+
+
+@patch("cosmos.cache.settings.enable_remote_cache_partial_parse", True)
+@patch("cosmos.cache._configure_remote_cache_dir")
+def test_upload_partial_parse_to_remote(mock_configure_remote_cache_dir, tmp_path):
+    remote_cache_dir = tmp_path / "remote"
+    remote_cache_dir.mkdir()
+    mock_configure_remote_cache_dir.return_value = remote_cache_dir
+    partial_parse_filepath = _create_local_partial_parse_artifacts(tmp_path / "local")
+
+    _upload_partial_parse_to_remote("dag", partial_parse_filepath)
+
+    remote_target_dir = remote_cache_dir / "dag" / DBT_TARGET_DIR_NAME
+    assert (remote_target_dir / DBT_PARTIAL_PARSE_FILE_NAME).read_bytes() == b"partial-parse-content"
+    assert (remote_target_dir / DBT_MANIFEST_FILE_NAME).read_text() == "manifest-content"
+    assert (remote_target_dir / f"{DBT_PARTIAL_PARSE_FILE_NAME}.md5").exists()
+
+
+@patch("cosmos.cache.settings.enable_remote_cache_partial_parse", True)
+@patch("cosmos.cache._configure_remote_cache_dir")
+def test_upload_partial_parse_to_remote_skips_unchanged_content(mock_configure_remote_cache_dir, tmp_path, caplog):
+    caplog.set_level(logging.DEBUG)
+    remote_cache_dir = tmp_path / "remote"
+    remote_cache_dir.mkdir()
+    mock_configure_remote_cache_dir.return_value = remote_cache_dir
+    partial_parse_filepath = _create_local_partial_parse_artifacts(tmp_path / "local")
+
+    _upload_partial_parse_to_remote("dag", partial_parse_filepath)
+
+    with patch("cosmos.cache.shutil.copyfileobj") as mock_copyfileobj:
+        _upload_partial_parse_to_remote("dag", partial_parse_filepath)
+
+    mock_copyfileobj.assert_not_called()
+    assert "is already up-to-date" in caplog.text
+
+
+def test_upload_partial_parse_to_remote_disabled_by_default(tmp_path):
+    partial_parse_filepath = _create_local_partial_parse_artifacts(tmp_path / "local")
+    with patch("cosmos.cache._configure_remote_cache_dir") as mock_configure_remote_cache_dir:
+        _upload_partial_parse_to_remote("dag", partial_parse_filepath)
+    mock_configure_remote_cache_dir.assert_not_called()
+
+
+@patch("cosmos.cache.settings.enable_remote_cache_partial_parse", True)
+@patch("cosmos.cache.shutil.copyfileobj", side_effect=OSError("connection reset"))
+@patch("cosmos.cache._configure_remote_cache_dir")
+def test_upload_partial_parse_to_remote_swallows_errors(
+    mock_configure_remote_cache_dir, mock_copyfileobj, tmp_path, caplog
+):
+    remote_cache_dir = tmp_path / "remote"
+    remote_cache_dir.mkdir()
+    mock_configure_remote_cache_dir.return_value = remote_cache_dir
+    partial_parse_filepath = _create_local_partial_parse_artifacts(tmp_path / "local")
+
+    _upload_partial_parse_to_remote("dag", partial_parse_filepath)
+
+    assert "Unable to upload the partial parse cache to remote" in caplog.text
 
 
 @pytest.fixture

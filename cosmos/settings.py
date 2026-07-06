@@ -54,6 +54,10 @@ pre_dbt_fusion = conf.getboolean("cosmos", "pre_dbt_fusion", fallback=False)
 # This will be merged with the `cache_dir` config parameter in upcoming releases.
 remote_cache_dir = conf.get("cosmos", "remote_cache_dir", fallback=None)
 remote_cache_dir_conn_id = conf.get("cosmos", "remote_cache_dir_conn_id", fallback=None)
+# Opt-in: also share the partial parse cache (partial_parse.msgpack) across workers via `remote_cache_dir`.
+# Defaults to False so existing `remote_cache_dir` users do not silently start paying per-task
+# object-storage transfer overhead. See #2797.
+enable_remote_cache_partial_parse = conf.getboolean("cosmos", "enable_remote_cache_partial_parse", fallback=False)
 remote_target_path = conf.get("cosmos", "remote_target_path", fallback=None)
 remote_target_path_conn_id = conf.get("cosmos", "remote_target_path_conn_id", fallback=None)
 upload_sql_to_xcom = conf.getboolean("cosmos", "upload_sql_to_xcom", fallback=True)

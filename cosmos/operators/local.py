@@ -534,6 +534,11 @@ class AbstractDbtLocalBase(AbstractDbtBase):
     def _handle_partial_parse(self, tmp_dir_path: Path) -> None:
         if self.cache_dir is None:
             return
+        if not get_partial_parse_path(self.cache_dir).exists():
+            # Cold worker: the local cache has no partial parse file yet, so seed it from the remote
+            # cache dir (no-op unless `enable_remote_cache_partial_parse` is enabled). Warm workers
+            # keep using the local cache without any remote round-trip.
+            cache._fetch_partial_parse_from_remote(self.cache_dir.name, self.cache_dir)
         latest_partial_parse = cache._get_latest_partial_parse(Path(self.project_dir), self.cache_dir)
         self.log.info("Partial parse is enabled and the latest partial parse file is %s", latest_partial_parse)
         if latest_partial_parse is not None:
@@ -605,6 +610,7 @@ class AbstractDbtLocalBase(AbstractDbtBase):
         partial_parse_file = get_partial_parse_path(tmp_dir_path)
         if partial_parse_file.exists():
             cache._update_partial_parse_cache(partial_parse_file, self.cache_dir)
+            cache._upload_partial_parse_to_remote(self.cache_dir.name, partial_parse_file)
 
     def _push_run_results_to_xcom(self, tmp_project_dir: str, context: Context) -> None:
         run_results_path = Path(tmp_project_dir) / "target" / "run_results.json"

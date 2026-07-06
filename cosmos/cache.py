@@ -3,6 +3,9 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import os
+import shutil
+import tempfile
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -24,7 +27,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from cosmos import settings
-from cosmos.fs import safe_copy
+from cosmos.fs import _calculate_file_checksum, safe_copy
 
 if TYPE_CHECKING:
     try:
@@ -37,6 +40,7 @@ if TYPE_CHECKING:
 
 from cosmos.constants import (
     DBT_MANIFEST_FILE_NAME,
+    DBT_PARTIAL_PARSE_FILE_NAME,
     DBT_TARGET_DIR_NAME,
     DEFAULT_PROFILES_FILE_NAME,
     FILE_SCHEME_AIRFLOW_DEFAULT_CONN_ID_MAP,
@@ -259,6 +263,125 @@ def _update_partial_parse_cache(latest_partial_parse_filepath: Path, cache_dir: 
     # cause msgpack to fail when the next task tries to load it (see #971/#972).
     safe_copy(latest_partial_parse_filepath, cache_path)
     safe_copy(latest_manifest_filepath, manifest_path)
+
+
+def _get_remote_partial_parse_dir(cache_identifier: str) -> Path | ObjectStoragePath | None:
+    """
+    Return the remote directory holding the shared partial parse artifacts for a Cosmos DbtDag or
+    DbtTaskGroup, or None when the remote partial parse cache is disabled or not configured.
+
+    :param cache_identifier: Unique key used as a cache identifier (same identifier used for the local cache dir)
+    """
+    if not settings.enable_remote_cache_partial_parse:
+        return None
+    remote_cache_dir = _configure_remote_cache_dir()
+    if remote_cache_dir is None:
+        return None
+    return remote_cache_dir / cache_identifier / DBT_TARGET_DIR_NAME
+
+
+def _download_remote_file(remote_filepath: Path | ObjectStoragePath, local_filepath: Path) -> None:
+    """
+    Download a remote file to a local path atomically (temporary file + rename), so concurrent
+    local readers never observe a partially-downloaded file.
+
+    :param remote_filepath: Path to the remote (object storage) file
+    :param local_filepath: Local destination path
+    """
+    temp_fd, temp_path = tempfile.mkstemp(dir=local_filepath.parent)
+    os.close(temp_fd)
+    try:
+        with remote_filepath.open("rb") as remote_fp, open(temp_path, "wb") as local_fp:
+            shutil.copyfileobj(remote_fp, local_fp)
+        os.replace(temp_path, local_filepath)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def _fetch_partial_parse_from_remote(cache_identifier: str, cache_dir: Path) -> None:
+    """
+    Seed the local partial parse cache from the remote cache dir, so a fresh (cold) worker can skip
+    the full dbt parse by reusing the partial parse file produced by tasks run on other workers.
+
+    Best-effort: the partial parse cache is an optimisation, so any remote storage failure is logged
+    and swallowed rather than failing the task — dbt simply falls back to a full parse.
+
+    :param cache_identifier: Unique key used as a cache identifier (same identifier used for the local cache dir)
+    :param cache_dir: Path to the local Cosmos project cache directory to seed
+    """
+    remote_target_dir = _get_remote_partial_parse_dir(cache_identifier)
+    if remote_target_dir is None:
+        return
+
+    try:
+        remote_partial_parse_filepath = remote_target_dir / DBT_PARTIAL_PARSE_FILE_NAME
+        if not remote_partial_parse_filepath.exists():
+            return
+        local_partial_parse_filepath = get_partial_parse_path(cache_dir)
+        local_partial_parse_filepath.parent.mkdir(parents=True, exist_ok=True)
+        _download_remote_file(remote_partial_parse_filepath, local_partial_parse_filepath)
+
+        remote_manifest_filepath = remote_target_dir / DBT_MANIFEST_FILE_NAME
+        if remote_manifest_filepath.exists():
+            _download_remote_file(
+                remote_manifest_filepath, local_partial_parse_filepath.parent / DBT_MANIFEST_FILE_NAME
+            )
+        logger.info("Fetched partial parse cache from remote `%s` into `%s`", remote_target_dir, cache_dir)
+    except Exception as e:
+        logger.warning("Unable to fetch the partial parse cache from remote `%s` due to %r", remote_target_dir, e)
+
+
+def _upload_partial_parse_to_remote(cache_identifier: str, latest_partial_parse_filepath: Path) -> None:
+    """
+    Upload the latest partial parse artifacts to the remote cache dir, making them available to
+    other (including future) workers.
+
+    The upload is skipped when the remote copy already has the same content, tracked via a small
+    checksum file next to the remote artifacts, so unchanged (and potentially large) msgpack and
+    manifest files are not re-uploaded after every task.
+
+    Best-effort: any remote storage failure is logged and swallowed rather than failing a task whose
+    dbt command already succeeded.
+
+    :param cache_identifier: Unique key used as a cache identifier (same identifier used for the local cache dir)
+    :param latest_partial_parse_filepath: Path to the most up-to-date partial parse file
+    """
+    remote_target_dir = _get_remote_partial_parse_dir(cache_identifier)
+    if remote_target_dir is None:
+        return
+
+    try:
+        checksum = _calculate_file_checksum(latest_partial_parse_filepath)
+        remote_checksum_filepath = remote_target_dir / f"{DBT_PARTIAL_PARSE_FILE_NAME}.md5"
+        if checksum and remote_checksum_filepath.exists():
+            with remote_checksum_filepath.open("r") as fp:
+                if fp.read().strip() == checksum:
+                    logger.debug("Remote partial parse cache `%s` is already up-to-date", remote_target_dir)
+                    return
+
+        remote_target_dir.mkdir(parents=True, exist_ok=True)
+
+        remote_partial_parse_filepath = remote_target_dir / DBT_PARTIAL_PARSE_FILE_NAME
+        with (
+            open(latest_partial_parse_filepath, "rb") as local_fp,
+            remote_partial_parse_filepath.open("wb") as remote_fp,
+        ):
+            shutil.copyfileobj(local_fp, remote_fp)
+
+        latest_manifest_filepath = latest_partial_parse_filepath.parent / DBT_MANIFEST_FILE_NAME
+        if latest_manifest_filepath.exists():
+            remote_manifest_filepath = remote_target_dir / DBT_MANIFEST_FILE_NAME
+            with open(latest_manifest_filepath, "rb") as local_fp, remote_manifest_filepath.open("wb") as remote_fp:
+                shutil.copyfileobj(local_fp, remote_fp)
+
+        # The checksum is written last so it only advertises fully-uploaded artifacts.
+        if checksum:
+            with remote_checksum_filepath.open("w") as fp:
+                fp.write(checksum)
+        logger.info("Uploaded partial parse cache to remote `%s`", remote_target_dir)
+    except Exception as e:
+        logger.warning("Unable to upload the partial parse cache to remote `%s` due to %r", remote_target_dir, e)
 
 
 def patch_partial_parse_content(partial_parse_filepath: Path, project_path: Path) -> bool:

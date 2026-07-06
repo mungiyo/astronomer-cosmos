@@ -65,6 +65,21 @@ Or environment variable:
     AIRFLOW__COSMOS__CACHE_DIR="path/to/docs/here"  # to override default caching directory (by default, uses the system temporary directory)
     AIRFLOW__COSMOS__ENABLE_CACHE_PARTIAL_PARSE="False"  # to disable caching (enabled by default)
 
+Because this cache is local to each worker node, it does not survive worker replacement: with ephemeral or
+auto-scaling workers (e.g. MWAA, Astro, Kubernetes), each new worker pays the cost of a full dbt parse on its first
+task. Starting with Cosmos 1.16, if a remote cache directory is configured (see :ref:`remote_cache_dir`), users can
+opt in to sharing the partial parse cache across workers:
+
+.. code-block:: cfg
+
+    [cosmos]
+    remote_cache_dir = s3://your_s3_bucket/cache_dir/
+    enable_remote_cache_partial_parse = True
+
+With this setting, a worker whose local cache is still empty downloads the latest ``partial_parse.msgpack`` from the
+remote cache directory before running the dbt command, and tasks upload the latest artifacts back to the remote cache
+after a successful run (the upload is skipped when the content did not change).
+
 Learn more about :doc:`caching </optimize_performance/caching>` and :doc:`Cosmos Airflow configurations </reference/configs/cosmos-conf>`.
 
 Disabling

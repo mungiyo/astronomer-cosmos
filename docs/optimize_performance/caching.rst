@@ -237,6 +237,14 @@ Users can customize where to store the cache using the setting ``AIRFLOW__COSMOS
 
 It is possible to switch off this feature by exporting the environment variable ``AIRFLOW__COSMOS__ENABLE_CACHE_PARTIAL_PARSE=0``.
 
+Since the local cache lives in the worker node's temporary directory, it does not survive worker replacement — with
+ephemeral or auto-scaling workers (e.g. MWAA, Astro, Kubernetes), every new worker pays the cost of a full dbt parse
+on its first task. Starting with Cosmos 1.16, users who configured :ref:`remote_cache_dir` can opt in to also share
+the partial parse cache across workers by setting ``AIRFLOW__COSMOS__ENABLE_REMOTE_CACHE_PARTIAL_PARSE=1``. Cold
+workers seed their local cache from the remote storage, and tasks upload the latest partial parse artifacts back to
+it after a successful run (skipping the upload when the content did not change). See
+:ref:`enable_remote_cache_partial_parse` for details.
+
 For more information, read the :doc:`Cosmos partial parsing documentation </guides/run_dbt/customization/partial-parsing>`
 
 
