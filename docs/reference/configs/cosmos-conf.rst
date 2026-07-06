@@ -246,6 +246,26 @@ This page lists all available `Apache Airflow® <https://airflow.apache.org/>`_ 
     - Default: ``None``
     - Environment Variable: ``AIRFLOW__COSMOS__REMOTE_CACHE_DIR_CONN_ID``
 
+.. _enable_remote_cache_partial_parse:
+
+`enable_remote_cache_partial_parse`_:
+    (Introduced in Cosmos 1.16.0) When enabled, Cosmos also stores the dbt partial parse file
+    (``partial_parse.msgpack``) and its companion ``manifest.json`` in :ref:`remote_cache_dir`, so the partial parse
+    cache is shared across worker nodes. A worker whose local cache does not have a partial parse file yet (e.g. a
+    freshly provisioned or auto-scaled worker) downloads the artifacts from the remote cache before running the dbt
+    command, instead of paying the cost of a full dbt project parse. After a successful task run, Cosmos uploads the
+    latest artifacts back to the remote cache when their content changed.
+
+    This is particularly useful for deployments with ephemeral or auto-scaling workers (e.g. MWAA, Astro, Kubernetes),
+    where the local cache directory does not survive worker replacement.
+
+    Remote storage access adds transfer latency: cold workers pay one download per (DAG, task) cache directory, and
+    tasks that change the partial parse file pay one upload. Workers with a warm local cache do not perform any remote
+    reads. Requires :ref:`remote_cache_dir` to be configured.
+
+    - Default: ``False``
+    - Environment Variable: ``AIRFLOW__COSMOS__ENABLE_REMOTE_CACHE_PARTIAL_PARSE``
+
 .. _remote_target_path:
 
 `remote_target_path`_:

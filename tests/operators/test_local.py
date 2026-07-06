@@ -1097,6 +1097,58 @@ def test_dbt_base_operator_no_partial_parse() -> None:
     assert "--no-partial-parse" in cmd
 
 
+@patch("cosmos.operators.local.cache._get_latest_partial_parse", return_value=None)
+@patch("cosmos.operators.local.cache._fetch_partial_parse_from_remote")
+def test_handle_partial_parse_fetches_remote_when_local_cache_is_cold(
+    mock_fetch_from_remote, mock_get_latest_partial_parse, tmp_path
+):
+    cache_dir = tmp_path / "cosmos-cache" / "my_dag"
+    (cache_dir / "target").mkdir(parents=True)
+    dbt_base_operator = ConcreteDbtLocalBaseOperator(
+        profile_config=profile_config, task_id="my-task", project_dir="my/dir", cache_dir=cache_dir
+    )
+
+    dbt_base_operator._handle_partial_parse(tmp_path / "tmp-project-dir")
+
+    mock_fetch_from_remote.assert_called_once_with("my_dag", cache_dir)
+
+
+@patch("cosmos.operators.local.cache._get_latest_partial_parse", return_value=None)
+@patch("cosmos.operators.local.cache._fetch_partial_parse_from_remote")
+def test_handle_partial_parse_skips_remote_when_local_cache_is_warm(
+    mock_fetch_from_remote, mock_get_latest_partial_parse, tmp_path
+):
+    cache_dir = tmp_path / "cosmos-cache" / "my_dag"
+    (cache_dir / "target").mkdir(parents=True)
+    (cache_dir / "target" / "partial_parse.msgpack").touch()
+    dbt_base_operator = ConcreteDbtLocalBaseOperator(
+        profile_config=profile_config, task_id="my-task", project_dir="my/dir", cache_dir=cache_dir
+    )
+
+    dbt_base_operator._handle_partial_parse(tmp_path / "tmp-project-dir")
+
+    mock_fetch_from_remote.assert_not_called()
+
+
+@patch("cosmos.operators.local.cache._update_partial_parse_cache")
+@patch("cosmos.operators.local.cache._upload_partial_parse_to_remote")
+def test_update_partial_parse_cache_uploads_to_remote(mock_upload_to_remote, mock_update_partial_parse_cache, tmp_path):
+    cache_dir = tmp_path / "cosmos-cache" / "my_dag"
+    cache_dir.mkdir(parents=True)
+    dbt_base_operator = ConcreteDbtLocalBaseOperator(
+        profile_config=profile_config, task_id="my-task", project_dir="my/dir", cache_dir=cache_dir
+    )
+    tmp_project_dir = tmp_path / "tmp-project-dir"
+    (tmp_project_dir / "target").mkdir(parents=True)
+    partial_parse_file = tmp_project_dir / "target" / "partial_parse.msgpack"
+    partial_parse_file.touch()
+
+    dbt_base_operator._update_partial_parse_cache(tmp_project_dir)
+
+    mock_update_partial_parse_cache.assert_called_once_with(partial_parse_file, cache_dir)
+    mock_upload_to_remote.assert_called_once_with("my_dag", partial_parse_file)
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("invocation_mode", [InvocationMode.SUBPROCESS, InvocationMode.DBT_RUNNER])
 def test_run_test_operator_with_callback(invocation_mode, failing_test_dbt_project):
